@@ -2,3 +2,4 @@ functions-framework==3.*
 requests
 gspread
 google-auth
+urllib3  # requestsの依存だが、リトライロジックで直接importしているため明記推奨
