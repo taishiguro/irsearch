@@ -4,11 +4,17 @@ import json
 import logging
 from typing import List, Optional, Dict, Any, Tuple
 
+# ▼▼▼ 変更点1: Flask をインポート ▼▼▼
+from flask import Flask, request
+
 import requests
 import google.auth
 import gspread
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# ▼▼▼ 変更点2: Flaskアプリケーションを初期化 (変数名は必ず 'app') ▼▼▼
+app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
 # 設定・定数定義
@@ -46,10 +52,8 @@ def get_session_with_retries() -> requests.Session:
 def get_target_codes_from_sheet(sheet_id: str) -> List[str]:
     """
     スプレッドシートから監視対象のEDINETコードリストを取得する。
-    
     Args:
         sheet_id (str): Google Spreadsheet ID
-    
     Returns:
         List[str]: クリーニング済みのEDINETコードリスト
     """
@@ -95,11 +99,9 @@ def get_target_codes_from_sheet(sheet_id: str) -> List[str]:
 def fetch_edinet_documents(date_str: str, api_key: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
     """
     EDINET APIから指定日の書類一覧を取得する。
-    
     Args:
         date_str (str): YYYY-MM-DD形式の日付
         api_key (str, optional): EDINET API Subscription-Key
-    
     Returns:
         Optional[List[Dict]]: 書類情報のリスト。APIエラー時はNone。
     """
@@ -158,14 +160,15 @@ def notify_slack(webhook_url: str, message: Dict[str, str]) -> bool:
 # メインロジック
 # ---------------------------------------------------------------------------
 
-def check_edinet_and_notify(request) -> Tuple[str, int]:
+# ▼▼▼ 変更点3: @app.route でWebアクセスを受け付けるように修正 ▼▼▼
+# Cloud Scheduler (POST) やブラウザ確認 (GET) に対応
+@app.route("/", methods=["POST", "GET"])
+def check_edinet_and_notify() -> Tuple[str, int]:
     """
-    Cloud Run Functionのエントリーポイント。
+    Cloud Run Serviceのエントリーポイント。
     監視対象企業の新規開示情報をチェックし、Slackに通知する。
-    
-    注意: 本ロジックはステートレスであるため、重複通知を防ぐために
-    スケジューラ（Cloud Scheduler）の実行間隔と「日中/夜間」の判定ロジックに依存しています。
     """
+    # 引数 `request` は削除しました（内部で使用されていないため）
     try:
         # 1. 環境変数の取得と検証
         sheet_id = os.environ.get('SPREADSHEET_ID')
@@ -225,8 +228,6 @@ def check_edinet_and_notify(request) -> Tuple[str, int]:
                     continue
 
                 # 通知判定ロジック (重複防止用)
-                # is_night_run (16時以降) の場合は、15:45以降の開示のみを通知対象とする。
-                # これにより、日中（〜15:45）に実行されたバッチでの通知分との重複を防ぐ設計。
                 should_notify = True
                 if is_night_run and submit_dt <= threshold_time:
                     should_notify = False
@@ -236,8 +237,7 @@ def check_edinet_and_notify(request) -> Tuple[str, int]:
                     filer_name = doc.get("filerName", "不明な企業")
                     doc_id = doc.get("docID", "")
                     
-                    # リンク生成: type=2を指定してPDFを取得させる
-                    # 注意: API仕様上、docIDが存在してもPDFがない場合もあるが、一般的にはこれで機能する
+                    # リンク生成
                     download_link = f"{EDINET_API_BASE_URL}/documents/{doc_id}?type=2"
                     
                     # Slackメッセージの構築
@@ -258,8 +258,7 @@ def check_edinet_and_notify(request) -> Tuple[str, int]:
             time_label = "夜間チェック" if is_night_run else "日中チェック"
             logger.info(f"No new disclosures found for target companies ({time_label}).")
             
-            # 必須要件でなければ、通知ゼロの際のSlack通知は省略しても良い（ノイズ削減のため）。
-            # ここでは元の仕様を尊重し送信する。
+            # 通知ゼロのメッセージ
             no_data_message = {
                 "text": (
                     f"✅ *開示なし ({today_str} {time_label})*\n"
@@ -275,3 +274,9 @@ def check_edinet_and_notify(request) -> Tuple[str, int]:
     except Exception as e:
         logger.exception(f"Critical Internal Error: {e}")
         return f"Internal Error: {str(e)}", 500
+
+# ▼▼▼ 変更点4: 起動スクリプトを追加 ▼▼▼
+if __name__ == "__main__":
+    # Cloud Run は環境変数 PORT (デフォルト8080) を指定してくるため、それに従う
+    port = int(os.environ.get("PORT", 8080))
+    app.run(debug=True, host="0.0.0.0", port=port)
