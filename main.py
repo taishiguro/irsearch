@@ -14,7 +14,7 @@ from urllib3.util.retry import Retry
 # 設定・定数定義
 # ---------------------------------------------------------------------------
 
-# ログ設定: Cloud Runのログシステムに対応するため標準ロガーを使用
+# ログ設定: Cloud Runのログシステムに対応
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -22,10 +22,11 @@ logger = logging.getLogger(__name__)
 JST = datetime.timezone(datetime.timedelta(hours=9), 'JST')
 
 # EDINET API V2 エンドポイント
-EDINET_API_URL = "https://disclosure.edinet-fsa.go.jp/api/v2/documents.json"
+EDINET_API_BASE_URL = "https://disclosure.edinet-fsa.go.jp/api/v2"
+EDINET_DOC_LIST_URL = f"{EDINET_API_BASE_URL}/documents.json"
 
 # リクエストのタイムアウト設定 (秒)
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 10.0
 
 # ---------------------------------------------------------------------------
 # ヘルパー関数
@@ -34,16 +35,17 @@ REQUEST_TIMEOUT = 10
 def get_session_with_retries() -> requests.Session:
     """
     リトライロジックを含むHTTPセッションを作成する。
-    一時的なネットワークエラーに対する耐性を高める。
+    一時的なネットワークエラー（5xx系）に対する耐性を高める。
     """
     session = requests.Session()
+    # backoff_factor=1 により、1秒, 2秒, 4秒と待機時間が増加
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
     return session
 
 def get_target_codes_from_sheet(sheet_id: str) -> List[str]:
     """
-    スプレッドシートからEDINETコードのリストを取得する。
+    スプレッドシートから監視対象のEDINETコードリストを取得する。
     
     Args:
         sheet_id (str): Google Spreadsheet ID
@@ -52,17 +54,20 @@ def get_target_codes_from_sheet(sheet_id: str) -> List[str]:
         List[str]: クリーニング済みのEDINETコードリスト
     """
     if not sheet_id:
-        logger.error("SPREADSHEET_ID is not set.")
+        logger.error("Configuration Error: SPREADSHEET_ID is not set.")
         return []
 
     try:
         # Google Cloudの認証情報を自動取得 (Cloud RunのService Accountを使用)
         scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+        # default() は環境に応じて適切な認証情報を探索します
         creds, _ = google.auth.default(scopes=scopes)
         gc = gspread.authorize(creds)
 
         # シートを開く
         sh = gc.open_by_key(sheet_id)
+        # ワークシート名の変更に強いように、存在チェックまたはインデックス参照も検討可能だが、
+        # ここでは指定された運用通り名称指定とする
         worksheet = sh.worksheet("対象リスト")
 
         # A列(1列目)の値を全て取得
@@ -70,15 +75,15 @@ def get_target_codes_from_sheet(sheet_id: str) -> List[str]:
 
         # フィルタリング処理: 空白除去し、'E'から始まる正規のEDINETコードのみ抽出
         clean_codes = [
-            c.strip() for c in codes 
-            if c and isinstance(c, str) and c.strip().startswith('E')
+            str(c).strip() for c in codes 
+            if c and str(c).strip().startswith('E')
         ]
         
-        logger.info(f"Loaded {len(clean_codes)} codes from sheet.")
+        logger.info(f"Successfully loaded {len(clean_codes)} codes from sheet.")
         return clean_codes
 
     except gspread.exceptions.SpreadsheetNotFound:
-        logger.error("Spreadsheet not found. Check the ID and permissions.")
+        logger.error(f"Spreadsheet not found. ID: {sheet_id}")
         return []
     except gspread.exceptions.WorksheetNotFound:
         logger.error("Worksheet '対象リスト' not found.")
@@ -89,37 +94,33 @@ def get_target_codes_from_sheet(sheet_id: str) -> List[str]:
 
 def fetch_edinet_documents(date_str: str, api_key: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
     """
-    EDINET APIから書類一覧を取得する。
+    EDINET APIから指定日の書類一覧を取得する。
     
     Args:
         date_str (str): YYYY-MM-DD形式の日付
-        api_key (str, optional): EDINET API Subscription-Key (V2利用時推奨)
+        api_key (str, optional): EDINET API Subscription-Key
     
     Returns:
-        Optional[List[Dict]]: 
-            - 成功時: 書類情報のリスト (0件の場合は空リスト [])
-            - 失敗時: None
+        Optional[List[Dict]]: 書類情報のリスト。APIエラー時はNone。
     """
     params = {
         "date": date_str,
-        "type": 2  # 既出の書類一覧を取得
+        "type": 2  # type=2: 既出の書類一覧を取得 (メタデータ)
     }
     if api_key:
         params["Subscription-Key"] = api_key
 
     try:
         session = get_session_with_retries()
-        # verify=Trueはデフォルトだが明示的に記載 (SSL検証)
-        res = session.get(EDINET_API_URL, params=params, timeout=REQUEST_TIMEOUT)
+        res = session.get(EDINET_DOC_LIST_URL, params=params, timeout=REQUEST_TIMEOUT)
         
         if res.status_code != 200:
             logger.error(f"EDINET API Error: {res.status_code} - {res.text}")
-            return None # 明示的に失敗を示す
+            return None
 
         data = res.json()
         results = data.get("results")
         
-        # API仕様によりresultsがNoneの場合もあるため、空リストを保証する
         return results if results is not None else []
 
     except requests.exceptions.RequestException as e:
@@ -132,12 +133,9 @@ def fetch_edinet_documents(date_str: str, api_key: Optional[str] = None) -> Opti
 def notify_slack(webhook_url: str, message: Dict[str, str]) -> bool:
     """
     Slackに通知を送信する。
-    
-    Returns:
-        bool: 送信成功ならTrue
     """
     if not webhook_url:
-        logger.warning("Slack Webhook URL is missing. Skipping notification.")
+        logger.warning("Slack Webhook URL is missing.")
         return False
 
     try:
@@ -163,15 +161,16 @@ def notify_slack(webhook_url: str, message: Dict[str, str]) -> bool:
 def check_edinet_and_notify(request) -> Tuple[str, int]:
     """
     Cloud Run Functionのエントリーポイント。
+    監視対象企業の新規開示情報をチェックし、Slackに通知する。
     
-    Args:
-        request: Cloud Functions / Cloud Run framework request object
+    注意: 本ロジックはステートレスであるため、重複通知を防ぐために
+    スケジューラ（Cloud Scheduler）の実行間隔と「日中/夜間」の判定ロジックに依存しています。
     """
     try:
         # 1. 環境変数の取得と検証
         sheet_id = os.environ.get('SPREADSHEET_ID')
         webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
-        edinet_api_key = os.environ.get('EDINET_API_KEY') # オプション
+        edinet_api_key = os.environ.get('EDINET_API_KEY')
 
         if not sheet_id or not webhook_url:
             msg = "Critical config missing: SPREADSHEET_ID or SLACK_WEBHOOK_URL."
@@ -181,32 +180,29 @@ def check_edinet_and_notify(request) -> Tuple[str, int]:
         # 2. 監視対象リストの取得
         target_edinet_codes = get_target_codes_from_sheet(sheet_id)
         if not target_edinet_codes:
-            msg = "No target codes found. Aborting."
+            msg = "No target codes found in Spreadsheet. Aborting."
             logger.warning(msg)
+            # 正常にシートは読めたが中身がない場合は200で終了する運用もアリだが、ここでは異常として警告
             return msg, 500
         
-        # 高速化のためSetに変換
         target_codes_set = set(target_edinet_codes)
 
         # 3. 現在時刻と判定ロジックの設定
         now = datetime.datetime.now(JST)
         today_str = now.strftime('%Y-%m-%d')
         
-        # 閾値設定: 15:45 (通常、日中の開示の区切り目安)
+        # 閾値設定: 15:45 (東証の大引け後、主要な開示が出揃うタイミング)
         threshold_time = now.replace(hour=15, minute=45, second=0, microsecond=0)
         is_night_run = now.hour >= 16
 
         logger.info(f"Start Check - Date: {today_str}, NightRun: {is_night_run}, Targets: {len(target_codes_set)}")
 
         # 4. EDINET APIからデータ取得
-        results = fetch_edinet_documents(today_str, edinet_api_key)
+        results = fetch_edinet_documents(today_str, api_key=edinet_api_key)
         
-        # API通信自体が失敗した場合のみ 500 エラーとする
         if results is None:
-            return "Failed to fetch documents from EDINET API (Network or API Error).", 500
+            return "Failed to fetch documents from EDINET API.", 500
         
-        # results が空リスト [] の場合は、正常系として処理を続行する
-
         notification_count = 0
 
         # 5. フィルタリングと通知
@@ -225,11 +221,12 @@ def check_edinet_and_notify(request) -> Tuple[str, int]:
                     submit_dt = datetime.datetime.strptime(submit_str, '%Y-%m-%d %H:%M')
                     submit_dt = submit_dt.replace(tzinfo=JST)
                 except ValueError:
-                    logger.warning(f"Invalid date format: {submit_str}")
+                    logger.warning(f"Invalid date format from API: {submit_str}")
                     continue
 
-                # 通知判定ロジック
-                # 夜間実行時のみ、15:45以降の開示に絞る (日中実行分との重複防止)
+                # 通知判定ロジック (重複防止用)
+                # is_night_run (16時以降) の場合は、15:45以降の開示のみを通知対象とする。
+                # これにより、日中（〜15:45）に実行されたバッチでの通知分との重複を防ぐ設計。
                 should_notify = True
                 if is_night_run and submit_dt <= threshold_time:
                     should_notify = False
@@ -239,22 +236,30 @@ def check_edinet_and_notify(request) -> Tuple[str, int]:
                     filer_name = doc.get("filerName", "不明な企業")
                     doc_id = doc.get("docID", "")
                     
+                    # リンク生成: type=2を指定してPDFを取得させる
+                    # 注意: API仕様上、docIDが存在してもPDFがない場合もあるが、一般的にはこれで機能する
+                    download_link = f"{EDINET_API_BASE_URL}/documents/{doc_id}?type=2"
+                    
                     # Slackメッセージの構築
                     message = {
                         "text": (
                             f"📢 *開示情報 ({submit_str})*\n"
                             f"*企業名*: {filer_name}\n"
                             f"*書類*: {doc_title}\n"
-                            f"*リンク*: https://disclosure.edinet-fsa.go.jp/api/v2/documents/{doc_id}"
+                            f"*PDF*: {download_link}"
                         )
                     }
                     if notify_slack(webhook_url, message):
                         notification_count += 1
+                        logger.info(f"Notified: {filer_name} - {doc_title}")
         
-        # 6. 通知が0件だった場合のサマリ通知
-        # 監視対象企業に開示がない場合、またはEDINET全体の開示が0件の場合もここに来る
+        # 6. 通知なしのハンドリング
         if notification_count == 0:
             time_label = "夜間チェック" if is_night_run else "日中チェック"
+            logger.info(f"No new disclosures found for target companies ({time_label}).")
+            
+            # 必須要件でなければ、通知ゼロの際のSlack通知は省略しても良い（ノイズ削減のため）。
+            # ここでは元の仕様を尊重し送信する。
             no_data_message = {
                 "text": (
                     f"✅ *開示なし ({today_str} {time_label})*\n"
@@ -268,6 +273,5 @@ def check_edinet_and_notify(request) -> Tuple[str, int]:
         return result_msg, 200
 
     except Exception as e:
-        # キャッチされなかった予期せぬエラーの記録
         logger.exception(f"Critical Internal Error: {e}")
         return f"Internal Error: {str(e)}", 500
